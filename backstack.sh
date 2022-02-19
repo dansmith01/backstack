@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/sh
 #
 # ---------------------------------------- #
 #   Daniel Smith - February 18th, 2022     #
@@ -118,6 +118,17 @@ BUCKET=${BUCKET%%/*}
 
 
 #--------------------------------------------------------------------
+# Parse apart the rotation scheme
+#--------------------------------------------------------------------
+ROTATE="${ROTATE}////"
+RECENT=`echo "$ROTATE" | cut -d '/' -f 1`
+DAILY=`echo "$ROTATE" | cut -d '/' -f 2`
+WEEKLY=`echo "$ROTATE" | cut -d '/' -f 3`
+MONTHLY=`echo "$ROTATE" | cut -d '/' -f 4`
+YEARLY=`echo "$ROTATE" | cut -d '/' -f 5`
+
+
+#--------------------------------------------------------------------
 # Sanity check arguments.
 #--------------------------------------------------------------------
 [ -n "$DEST" ]                   || { errmsg "--dest is required.";                     exit 1; }
@@ -128,7 +139,6 @@ BUCKET=${BUCKET%%/*}
 [ -z "$INFILE" -o -r "$INFILE" ] || { errmsg "Can't read --add file '$INFILE'.";        exit 1; }
 [ -z "$CONFIG" -o -r "$CONFIG" ] || { errmsg "Can't read --config file '$CONFIG'.";     exit 1; }
 
-IFS=/ read RECENT DAILY WEEKLY MONTHLY YEARLY <<< "$ROTATE"
 case ${RECENT:=0}  in *[!0-9]*) errmsg "recent must be an integer.";   exit 1 ;; esac
 case ${DAILY:=0}   in *[!0-9]*) errmsg "daily must be an integer.";    exit 1 ;; esac
 case ${WEEKLY:=0}  in *[!0-9]*) errmsg "weekly must be an integer.";   exit 1 ;; esac
@@ -150,10 +160,10 @@ aws sts get-caller-identity > /dev/null
 #--------------------------------------------------------------------
 # Upload the new achive to S3, unless in test mode
 #--------------------------------------------------------------------
-if [ -n "$INFILE"]
+if [ -n "$INFILE" ]
 then
 
-  if ["$TEST" -eq 1]
+  if [ "$TEST" -eq 1 ]
   then
     #--------------------------------------------------------------------
     # Just simulate the new file being added when in test mode
