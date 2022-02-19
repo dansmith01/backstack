@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ---------------------------------------- #
-#   Daniel Smith - February 15th, 2022     #
+#   Daniel Smith - February 18th, 2022     #
 #   Baylor College of Medicine             #
 #   Creative Commons License BY-SA 4.0     #
 # ---------------------------------------- #
@@ -11,7 +11,7 @@
 #----------------------------------------------------------
 # Default options for the script's parameters.
 #----------------------------------------------------------
-DEST=""; INFILE=""; TEST=0; CONFIG=""; EXT="";
+DEST=""; INFILE=""; TEST=0; CONFIG=""; EMAIL="";
 STORE="INTELLIGENT_TIERING"; ROTATE="5/7/6/12/5"; 
 
 
@@ -24,16 +24,14 @@ cat <<-EOM
   THIS SCRIPT WILL DELETE FILES. THE AUTHOR MAKES NO GUARANTEE 
   IT WILL ONLY DELETE THE RIGHT ONES. USE AT YOUR OWN RISK.
   
-  Usage: $0 -d s3://bucket/path/prefix_ [OPTIONS]
+  Usage: $0 -d s3://bucket/path/prefix_%.tgz [OPTIONS]
   
-      -d --dest    Destination path for backups.
+      -d --dest    Destination path template for backups.
       -r --rotate  Rotation scheme in recent/day/week/month/year format.
                    [Default: $ROTATE]
   
       -a --add     A file or folder to push to the backup destination.
-      -e --ext     Append this file extension to uploaded files.
-                   [Default: file=autodetect; folder=.tar.gz]
-  
+      -e --email   Use Amazon SES to send error messages to this address.
       -t --test    Do not change files - dry run only.
       -s --store   S3 storage class to use. [Default: $STORE]
       -c --config  Path to the AWS config file to use.
@@ -43,8 +41,10 @@ cat <<-EOM
   Removes old versions of backups according to the user's data retention
   policy (keep X daily, Y weekly, Z monthly, etc).
   
+  See https://github.com/dansmith01/backstack for additional help.
+  
   Example:
-    $0 --dest s3://xyz-backup/x_ --rotate /3/6 --test
+    $0 --dest s3://xyz-backup/x_%.tgz --rotate /3/6 --test
   
     s3://xyz-backup/x_2022-01-01-0500.tgz    KEEP
     s3://xyz-backup/x_2022-01-02-0500.tgz    DROP
@@ -63,11 +63,28 @@ EOM
 }
 
 
+#--------------------------------------------------------------------
+# Create a directory for our temporary files.
+#--------------------------------------------------------------------
+T=`mktemp -d`
+
+
 #----------------------------------------------------------
-# Error text
+# Write errors to STDERR, and optionally email
 #----------------------------------------------------------
+CMD="$0 $*"
 errmsg () {
-	>&2 echo "Error: $1"
+
+  >&2 echo "Error: $1\n"
+  
+  if [ -n "$EMAIL" -a "$TEST" -eq 0 ]
+  then
+    aws ses send-email                        \
+      --from    "$EMAIL"                      \
+      --to      "$EMAIL"                      \
+      --subject "Backup Error for $DEST"      \
+      --text    "`uname -n`: $CMD\nError: $1"
+  fi
 }
 
 
@@ -81,7 +98,7 @@ while [ $# -gt 0 ]; do
     -d|--dest)    DEST="$2";            shift 2 ;;
     -r|--rotate)  ROTATE="$2";          shift 2 ;;
     -a|--add)     INFILE="$2";          shift 2 ;;
-    -e|--ext)     EXT="$2";             shift 2 ;;
+    -e|--email)   EMAIL="$2";           shift 2 ;;
     -c|--config)  CONFIG="$2";          shift 2 ;;
     -s|--store)   STORE="$2";           shift 2 ;;
     -t|--test)    TEST=1;               shift 1 ;;
@@ -92,12 +109,24 @@ done
 
 
 #--------------------------------------------------------------------
+# Parse apart the destination template string
+#--------------------------------------------------------------------
+SUFFIX=${DEST##*%}
+PREFIX=${DEST%%%*}
+BUCKET=${DEST##*s3://}
+BUCKET=${BUCKET%%/*}
+
+
+#--------------------------------------------------------------------
 # Sanity check arguments.
 #--------------------------------------------------------------------
-[ -n "$DEST" ]                   || { errmsg "--dest is required.";                  exit 1; }
-[ -z "$INFILE" -o -r "$INFILE" ] || { errmsg "Can't read --add file '$INFILE'.";     exit 1; }
-[ -z "$CONFIG" -o -r "$CONFIG" ] || { errmsg "Can't read --config file '$CONFIG'.";  exit 1; }
-[ "${DEST:0:5}" == "s3://" ]     || { errmsg "-o must start with 's3://'.";          exit 1; }
+[ -n "$DEST" ]                   || { errmsg "--dest is required.";                     exit 1; }
+[ -n "$SUFFIX" ]                 || { errmsg "--dest must include a file extension.";   exit 1; }
+[ "$SUFFIX" != "$DEST" ]         || { errmsg "--dest must include the % placeholder.";  exit 1; }
+[ -z "${DEST%s3://*}" ]          || { errmsg "--dest must start with 's3://'.";         exit 1; }
+[ "${BUCKET#*%}" = "$BUCKET" ]   || { errmsg "Invalid destination bucket '$BUCKET'.";   exit 1; }
+[ -z "$INFILE" -o -r "$INFILE" ] || { errmsg "Can't read --add file '$INFILE'.";        exit 1; }
+[ -z "$CONFIG" -o -r "$CONFIG" ] || { errmsg "Can't read --config file '$CONFIG'.";     exit 1; }
 
 IFS=/ read RECENT DAILY WEEKLY MONTHLY YEARLY <<< "$ROTATE"
 case ${RECENT:=0}  in *[!0-9]*) errmsg "recent must be an integer.";   exit 1 ;; esac
@@ -107,9 +136,6 @@ case ${MONTHLY:=0} in *[!0-9]*) errmsg "monthly must be an integer.";  exit 1 ;;
 case ${YEARLY:=0}  in *[!0-9]*) errmsg "yearly must be an integer.";   exit 1 ;; esac
 
 [ "$RECENT$DAILY$WEEKLY$MONTHLY$YEARLY" != "00000" ] || { errmsg "--rotate is required."; exit 1; }
-
-BUCKET=`echo $DEST | cut -f 3 -d '/'`
-[ -n "$BUCKET" ] || { errmsg "-o must include a bucket name."; exit 1; }
 
 
 #--------------------------------------------------------------------
@@ -122,37 +148,17 @@ aws sts get-caller-identity > /dev/null
 
 
 #--------------------------------------------------------------------
-# Create a directory for our temporary files.
+# Upload the new achive to S3, unless in test mode
 #--------------------------------------------------------------------
-T=`mktemp -d`
-
-
-#--------------------------------------------------------------------
-# Upload the new achive to S3, unless in test mode.
-#--------------------------------------------------------------------
-if [ -n "$INFILE" ]
+if [ -n "$INFILE"]
 then
-    
-  #--------------------------------------------------------------------
-  # Autodetect file extension.
-  #--------------------------------------------------------------------
-  if [ -d "$INFILE" ]
-  then
-    EXT=".tar.gz"
-  elif [ -z "$EXT" ]
-  then
-    FN=`basename "$INFILE"`
-    EXT=`echo "$FN" | rev | sed -r "s/^(.*\.).*/\1/" | rev`
-    [ $FN != $EXT ] || EXT=''
-  fi
-  
-  
-  if [ $TEST -eq 1 ]
+
+  if ["$TEST" -eq 1]
   then
     #--------------------------------------------------------------------
-    # Simulate this file being on S3.
+    # Just simulate the new file being added when in test mode
     #--------------------------------------------------------------------
-    echo "${DEST##*$BUCKET/}$(date '+%F-%H%M')$EXT" > $T/initial
+    echo "${PREFIX}$(date '+%F-%H%M')$SUFFIX" > $T/initial
   else
     
     #--------------------------------------------------------------------
@@ -160,30 +166,29 @@ then
     #--------------------------------------------------------------------
     if [ -d "$INFILE" ]
     then
-      tar -C `dirname "$INFILE"` -czf "$T/infile$EXT" `basename "$INFILE"`
-      INFILE="$T/infile$EXT"
+      tar -C `dirname "$INFILE"` -czf "$T/infile" `basename "$INFILE"`
+      INFILE="$T/infile"
     fi
     
     #--------------------------------------------------------------------
     # Upload to S3, renaming based on prefix and timestamp.
     #--------------------------------------------------------------------
-    aws s3 cp "$INFILE" "$DEST$(date '+%F-%H%M')$EXT" --storage-class "$STORE"
+    aws s3 cp "$INFILE" "${PREFIX}$(date '+%F-%H%M')$SUFFIX" --storage-class "$STORE"
     [ $? -eq 0 ] || { errmsg "'aws s3 cp' had non-zero exit status."; exit 1; }
+    
   fi
 
 fi
 
 
-
 #--------------------------------------------------------------------
 # Fetch the current archive names from S3 and parse out the dates.
 #--------------------------------------------------------------------
-aws s3 ls --recursive "$DEST" > $T/s3_ls
+aws s3 ls --recursive "$PREFIX" > $T/s3_ls
 [ $? -le 1 ] || { errmsg "'aws s3 ls' had non-zero exit status."; exit 1; }
 
-awk '{print $4}' $T/s3_ls >> $T/initial
-cat $T/initial                                    |\
-  sed -r "s/.*([0-9]{4}-[0-9]{2}-[0-9]{2}).*/\1/" |\
+awk '{print "s3://'$BUCKET'/"$4}' $T/s3_ls >> $T/initial
+cut -c $(( ${#PREFIX} + 1 ))-$(( ${#PREFIX} + 10 )) $T/initial     |\
   date '+%F%t%Y-%U%t%Y-%m%t%Y' -f - > $T/extract
 paste $T/extract $T/initial | sort -r > $T/search
 
@@ -192,10 +197,10 @@ paste $T/extract $T/initial | sort -r > $T/search
 # Now we have the following table, sorted from NEWEST -> OLDEST
 #--------------------------------------------------------------------
 #|  DAY         WEEK     MONTH    YEAR  FILE
-#|  2022-02-09  2022-06  2022-02  2022  x_2022-02-09-1100.tar.gz
-#|  2022-02-08  2022-06  2022-02  2022  x_2022-02-08-1000.tar.gz
-#|  2022-02-07  2022-06  2022-02  2022  x_2022-02-07-1200.tar.gz
-#|  2022-01-31  2022-05  2022-01  2022  x_2022-01-31-0800.tar.gz
+#|  2022-02-09  2022-06  2022-02  2022  s3://x/y_2022-02-09-1100.tgz
+#|  2022-02-08  2022-06  2022-02  2022  s3://x/y_2022-02-08-1000.tgz
+#|  2022-02-07  2022-06  2022-02  2022  s3://x/y_2022-02-07-1200.tgz
+#|  2022-01-31  2022-05  2022-01  2022  s3://x/y_2022-01-31-0800.tgz
 
 
 #--------------------------------------------------------------------
@@ -212,19 +217,16 @@ uniq -w 5  -f 3 $T/search | head -n $YEARLY  > $T/yearly
 # Intersect the lists to keep, then generate the list to drop.
 #--------------------------------------------------------------------
 cat $T/recent $T/daily $T/weekly $T/monthly $T/yearly |\
-  cut -f 5 | sort -u | grep -v "^$" |\
-  sed "s .* s3://$BUCKET/& " > $T/keep
+  cut -f 5 | sort -u | grep -v "^$" > $T/keep
 
-sort -u $T/initial | grep -v "^$" |\
-  sed "s .* s3://$BUCKET/& " > $T/initial_sorted
-  
+sort -u $T/initial | grep -v "^$" > $T/initial_sorted
 comm -23 $T/initial_sorted $T/keep > $T/drop
 
 
 #--------------------------------------------------------------------
 # Remove unneeded archives, or just display our plans to the user.
 #--------------------------------------------------------------------
-if [ $TEST -eq 1 ]
+if [ "$TEST" -eq 1 ]
 then
   cat $T/keep | sed "s .* &\tKEEP " >> $T/log
   cat $T/drop | sed "s .* &\tDROP " >> $T/log
